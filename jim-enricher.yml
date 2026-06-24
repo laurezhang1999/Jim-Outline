@@ -1,0 +1,63 @@
+name: Jim — Attio Watchlist Enricher
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode"
+        required: false
+        default: "blank-only"
+        type: choice
+        options:
+          - blank-only
+          - all
+          - new-only
+          - dry-run
+
+jobs:
+  enrich:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Restore state file
+        uses: actions/cache@v4
+        with:
+          path: processed_companies.json
+          key: jim-state-${{ github.run_id }}
+          restore-keys: |
+            jim-state-
+
+      - name: Run Jim enricher
+        env:
+          ATTIO_API_KEY: ${{ secrets.ATTIO_API_KEY }}
+          SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
+          SLACK_TOKEN: ${{ secrets.SLACK_TOKEN }}
+        run: |
+          MODE="${{ github.event.inputs.mode || 'blank-only' }}"
+          if [ "$MODE" = "all" ]; then
+            python jim_enricher.py --all
+          elif [ "$MODE" = "new-only" ]; then
+            python jim_enricher.py --new-only
+          elif [ "$MODE" = "dry-run" ]; then
+            python jim_enricher.py --dry-run
+          else
+            python jim_enricher.py
+          fi
+
+      - name: Save state file
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: processed_companies.json
+          key: jim-state-${{ github.run_id }}
