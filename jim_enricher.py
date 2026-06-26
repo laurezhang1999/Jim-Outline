@@ -217,7 +217,10 @@ def build_company_lookup():
             desc_vals = values.get("description", [])
             description = desc_vals[0].get("value", "") if desc_vals else ""
 
-            lookup[rid] = {"name": name, "domain": domain, "description": description}
+            type_vals = values.get("record_type", [])
+            record_type = type_vals[0].get("option", {}).get("title", "") if type_vals else ""
+
+            lookup[rid] = {"name": name, "domain": domain, "description": description, "record_type": record_type}
 
         print(".", end="", flush=True)
         # keep paginating as long as we received a full batch
@@ -227,6 +230,20 @@ def build_company_lookup():
 
     print(f" {len(lookup)} companies loaded.")
     return lookup
+
+
+def set_company_record_type(record_id, dry_run=False):
+    """Set record_type = 'Company' on the company object if it's blank."""
+    if dry_run:
+        print(f"    [dry-run] set record_type=Company on {record_id[:8]}")
+        return
+    r = requests.patch(
+        f"{ATTIO_BASE}/objects/companies/records/{record_id}",
+        headers=attio_headers(),
+        json={"data": {"values": {"record_type": "Company"}}},
+    )
+    if not r.ok:
+        print(f"    [warn] Could not set record_type ({r.status_code}): {r.text[:120]}")
 
 
 def get_entry_attr(entry, key):
@@ -475,20 +492,19 @@ def is_verified_fund(name):
     if len(words) == 1 and lower not in KNOWN_FUNDS:
         return False
 
-    # Suffix must appear in the last two words (not buried mid-sentence)
-    last_two = " ".join(words[-2:])
-    if any(s in last_two for s in VC_SUFFIXES) or lower in KNOWN_FUNDS:
+    # Accept if suffix appears anywhere in the name
+    if any(s in lower for s in VC_SUFFIXES) or lower in KNOWN_FUNDS:
         return True
 
-    # Ambiguous — one search, cached
+    # Ambiguous — accept by default, only reject if search confirms it's NOT a fund
     if lower in _fund_cache:
         return _fund_cache[lower]
     results = serper(f'"{name}" venture capital fund investor', num=3)
     text = snippets_text(results).lower()
     NOT_FUND_SIGNALS = ["product", "software company", "consumer brand", "restaurant", "retailer"]
-    rejected = not any(kw in text for kw in FUND_CONFIRM_KEYWORDS) and any(s in text for s in NOT_FUND_SIGNALS)
-    _fund_cache[lower] = not rejected
-    return not rejected
+    is_not_fund = not any(kw in text for kw in FUND_CONFIRM_KEYWORDS) and any(s in text for s in NOT_FUND_SIGNALS)
+    _fund_cache[lower] = not is_not_fund
+    return not is_not_fund
 
 
 def normalize_investors(raw):
@@ -675,9 +691,14 @@ def needs_enrichment(entry):
 
 def enrich(entry, company, dry_run=False, update_investors=False):
     entry_id    = entry["id"]["entry_id"]
+    record_id   = entry["parent_record_id"]
     name        = company.get("name", "").strip()
     domain      = company.get("domain", "").strip()
     description = company.get("description", "").strip()
+
+    # Set record_type = Company on the company object if blank
+    if not company.get("record_type"):
+        set_company_record_type(record_id, dry_run=dry_run)
 
     # Use domain as search key if name is missing
     search_name = name or domain.split(".")[0].replace("-", " ").title()

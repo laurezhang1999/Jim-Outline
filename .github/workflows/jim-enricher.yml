@@ -2,7 +2,7 @@ name: Jim — Attio Watchlist Enricher
 
 on:
   schedule:
-    - cron: "0 * * * *"
+    - cron: "0 */12 * * *"
   workflow_dispatch:
     inputs:
       mode:
