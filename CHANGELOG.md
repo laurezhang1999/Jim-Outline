@@ -20,3 +20,5 @@
 16. Added `find_people_at_funds()` to search Attio People records for contacts at known investor funds, writing results to `potential_investor_contact`.
 17. Added `--list-fields` flag to print all Attio watchlist field slugs for debugging.
 18. Batch Attio updates now retry field-by-field on failure to isolate bad fields without blocking the full update.
+19. `find_last_round_date` now returns both date and funding amount extracted from the same article, so `last_round_raised_time` and `amount_invested` are always in sync.
+20. When multiple articles match a funding round, the earliest-dated article (original announcement) is used as the source rather than a later recap.
