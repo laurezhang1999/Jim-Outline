@@ -466,7 +466,8 @@ def find_last_round_date(name, domain):
     if not candidates:
         return None, None
     # Pick the most recent date; prefer candidates that also have an amount
-    candidates.sort(key=lambda x: (x[0], x[1] is not None), reverse=True)
+    # Earliest date = original announcement; prefer candidates that also have an amount
+    candidates.sort(key=lambda x: (x[0], x[1] is None))
     return candidates[0]
 
 
