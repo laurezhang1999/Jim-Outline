@@ -246,6 +246,34 @@ def set_company_record_type(record_id, dry_run=False):
         print(f"    [warn] Could not set record_type ({r.status_code}): {r.text[:120]}")
 
 
+def get_entry_attr_with_timestamp(entry, key):
+    """Return (value, last_updated_datetime) for a field."""
+    values = entry.get("entry_values", {}).get(key, [])
+    if not values:
+        return None, None
+    v = values[0]
+    val = v.get("option", {}).get("title") or v.get("status", {}).get("title") or v.get("value") or v.get("currency_value")
+    ts = v.get("active_from")
+    last_updated = None
+    if ts:
+        try:
+            last_updated = datetime.strptime(ts[:10], "%Y-%m-%d")
+        except Exception:
+            pass
+    return val, last_updated
+
+
+def should_refresh_date(entry, months=6):
+    """Return True if last_round_raised_time is blank or was last set 6+ months ago."""
+    val, last_updated = get_entry_attr_with_timestamp(entry, "last_round_raised_time")
+    if not val:
+        return True
+    if last_updated is None:
+        return True
+    months_since = (datetime.now() - last_updated).days / 30.44
+    return months_since >= months
+
+
 def get_entry_attr(entry, key):
     """Extract a scalar value from a list entry's entry_values."""
     values = entry.get("entry_values", {}).get(key, [])
@@ -369,63 +397,77 @@ def find_funding(name, domain):
 
 
 def find_last_round_date(name, domain):
-    """Search recent news for when the last funding round was raised. Returns a date string or None."""
+    """
+    Search for when the company last raised and how much.
+    Returns (date_str, amount_float) — both from the same source so they stay in sync.
+    date_str is YYYY-MM-DD or YYYY-MM; amount_float is raw value in dollars or None.
+    """
     primary, fallback = _search_queries(name, domain)
-    results = serper(f'{primary} funding round raised 2023 2024 2025', num=10)
+    # Cast a wide net across news sources for funding announcements
+    results  = serper(f'"{name}" raises funding round announced 2023 2024 2025 2026', num=8)
+    results += serper(f'"{name}" funding site:techcrunch.com', num=3)
+    results += serper(f'"{name}" funding site:businesswire.com', num=3)
+    results += serper(f'"{name}" funding site:prnewswire.com', num=3)
+    results += serper(f'"{name}" funding site:axios.com', num=3)
+    results += serper(f'"{name}" crunchbase funding round', num=5)
     if not results:
-        results = serper(f'{fallback} funding round raised', num=10)
+        results = serper(f'{primary} funding round raised', num=8)
     results = rank_results_by_thesis(results)
 
     date_patterns = [
-        # "raised $10M in January 2024" / "closed a $5M round in March 2025"
-        r"(?:raised|closed|announced|secured)[^.]{0,60}?\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+(\d{4})",
-        # "2024-03-15" or "03/15/2024"
-        r"\b(20\d{2})[.\-/](0[1-9]|1[0-2])[.\-/](0[1-9]|[12]\d|3[01])\b",
-        # "Q1 2024"
-        r"\b(Q[1-4]\s+20\d{2})\b",
-        # standalone year near funding keyword — last resort
-        r"(?:raised|funded|round)[^.]{0,40}?\b(20(?:2[0-9]))\b",
+        (r"(?:raised|closed|secured|announced|completed)[^.]{0,80}?"
+         r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+         r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+         r"\s+(\d{4})", "month_year"),
+        (r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(20\d{2})\s*[·•\*]", "month_year"),
+        (r"(?:raised|round|seed|series|funding)[^.]{0,40}?"
+         r"(20\d{2})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])", "iso"),
+        (r"most recently[^.]{0,80}?"
+         r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+         r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+         r"\s+(\d{4})", "month_year"),
     ]
+    amount_pat = re.compile(r"\$\s*(\d+(?:\.\d+)?)\s*(M|B|million|billion)", re.IGNORECASE)
 
-    # Check each result's snippet + date field individually, prefer results with explicit dates
-    best_date = None
+    # Each candidate: (date_str, amount_or_None) — keep best pair
+    candidates = []
     for result in results:
         snippet = result.get("snippet", "") + " " + result.get("title", "")
-        # Serper sometimes returns a `date` field on news results
-        if result.get("date"):
-            try:
-                d = datetime.strptime(result["date"], "%b %d, %Y")
-                candidate = d.strftime("%Y-%m-%d")
-                if best_date is None or candidate > best_date:
-                    best_date = candidate
-                continue
-            except Exception:
-                pass
-        for pat in date_patterns:
+        date_str = None
+        for pat, fmt in date_patterns:
             m = re.search(pat, snippet, re.IGNORECASE)
             if m:
-                groups = m.groups()
-                # Month + Year format
-                if len(groups) == 2 and not groups[0].startswith("Q") and not groups[0].startswith("20"):
-                    try:
-                        d = datetime.strptime(f"{groups[0]} {groups[1]}", "%B %Y")
-                        candidate = d.strftime("%Y-%m")
-                        if best_date is None or candidate > best_date:
-                            best_date = candidate
-                    except Exception:
-                        pass
-                # Full ISO date
-                elif len(groups) == 3:
-                    candidate = f"{groups[0]}-{groups[1]}-{groups[2]}"
-                    if best_date is None or candidate > best_date:
-                        best_date = candidate
-                # Q1 2024 or standalone year
-                else:
-                    candidate = groups[0]
-                    if best_date is None or candidate > best_date:
-                        best_date = candidate
+                try:
+                    g = m.groups()
+                    if fmt == "month_year":
+                        for fmt_str in ("%B %Y", "%b %Y"):
+                            try:
+                                date_str = datetime.strptime(f"{g[0]} {g[1]}", fmt_str).strftime("%Y-%m")
+                                break
+                            except Exception:
+                                continue
+                    elif fmt == "iso":
+                        date_str = f"{g[0]}-{g[1]}-{g[2]}"
+                except Exception:
+                    pass
                 break
-    return best_date
+        if not date_str:
+            continue
+        # Extract amount from the same snippet
+        amount = None
+        am = amount_pat.search(snippet)
+        if am:
+            val = float(am.group(1))
+            if am.group(2).lower() in ("b", "billion"):
+                val *= 1000
+            amount = val * 1_000_000
+        candidates.append((date_str, amount))
+
+    if not candidates:
+        return None, None
+    # Pick the most recent date; prefer candidates that also have an amount
+    candidates.sort(key=lambda x: (x[0], x[1] is not None), reverse=True)
+    return candidates[0]
 
 
 # Noise tokens — rejected immediately, no search needed
@@ -689,7 +731,7 @@ def needs_enrichment(entry):
     )
 
 
-def enrich(entry, company, dry_run=False, update_investors=False):
+def enrich(entry, company, dry_run=False, update_investors=False, refresh_dates=False):
     entry_id    = entry["id"]["entry_id"]
     record_id   = entry["parent_record_id"]
     name        = company.get("name", "").strip()
@@ -765,11 +807,18 @@ def enrich(entry, company, dry_run=False, update_investors=False):
             updates["amount_invested"] = amt
             row["funding_raised"] = f"${amt/1e6:.0f}M"
 
-    # Last round date — always refresh from news
-    last_round_date = find_last_round_date(search_name, domain)
+    # Last round date — search if blank, 6+ months stale, or --refresh-dates forced
+    last_round_date = get_entry_attr(entry, "last_round_raised_time")
+    if refresh_dates or should_refresh_date(entry, months=6):
+        found_date, found_amount = find_last_round_date(search_name, domain)
+        if found_date:
+            last_round_date = found_date
+            updates["last_round_raised_time"] = found_date
+        # Only fill amount if we got it from the same source (same search call)
+        if found_amount and row["funding_raised"] is None:
+            updates["amount_invested"] = found_amount
+            row["funding_raised"] = f"${found_amount/1e6:.0f}M"
     row["last_round_raised_time"] = last_round_date or "—"
-    if last_round_date:
-        updates["last_round_raised_time"] = last_round_date
 
     # May raise soon flag
     # Thresholds based on industry average time between rounds:
@@ -860,6 +909,7 @@ def main():
     parser.add_argument("--update-sectors", action="store_true", help="Re-evaluate sector for all entries (migrates old labels, re-searches unmappable ones)")
     parser.add_argument("--list-fields",       action="store_true", help="Print all Attio watchlist field slugs and exit")
     parser.add_argument("--update-investors", action="store_true", help="Re-search and overwrite investor field for all entries")
+    parser.add_argument("--refresh-dates",    action="store_true", help="Force re-search last round date for all entries, ignoring the 6-month gate")
     parser.add_argument("--company",        nargs="+", help="Force enrich specific company names (e.g. --company Ampere Aperture)")
     args = parser.parse_args()
 
@@ -915,6 +965,9 @@ def main():
         if args.update_investors:
             to_process.append(entry)
             continue
+        if args.refresh_dates:
+            to_process.append(entry)
+            continue
         if not args.all and not needs_enrichment(entry):
             continue
         to_process.append(entry)
@@ -926,7 +979,7 @@ def main():
         record_id = entry["parent_record_id"]
         company = company_lookup.get(record_id, {"name": f"[{record_id[:8]}]", "domain": "", "description": ""})
         try:
-            row = enrich(entry, company, dry_run=args.dry_run, update_investors=args.update_investors)
+            row = enrich(entry, company, dry_run=args.dry_run, update_investors=args.update_investors, refresh_dates=args.refresh_dates)
             rows.append(row)
             processed.add(record_id)
             if not args.dry_run:
